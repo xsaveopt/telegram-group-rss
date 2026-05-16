@@ -1,0 +1,7 @@
+/telegram-group-rss
+/tgrss
+/dist
+/tmp
+.env
+.env.*
+!.env.example
