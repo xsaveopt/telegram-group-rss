@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,6 +83,27 @@ type watcher struct {
 	name     string
 	store    *Store
 	interval time.Duration
+
+	mu    sync.RWMutex
+	title string
+}
+
+func (w *watcher) Title() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.title != "" {
+		return w.title
+	}
+	return w.name
+}
+
+func (w *watcher) setTitle(t string) {
+	if t == "" {
+		return
+	}
+	w.mu.Lock()
+	w.title = t
+	w.mu.Unlock()
 }
 
 func (w *watcher) loop(ctx context.Context) {
@@ -92,11 +114,12 @@ func (w *watcher) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			msgs, err := fetchChannel(ctx, w.name)
+			title, msgs, err := fetchChannel(ctx, w.name)
 			if err != nil {
 				log.Printf("fetch %s: %v", w.name, err)
 				continue
 			}
+			w.setTitle(title)
 			if n := w.store.Add(msgs); n > 0 {
 				log.Printf("%s: %d new messages", w.name, n)
 			}
@@ -140,17 +163,29 @@ func (m *manager) get(name string) (*watcher, error) {
 	m.wch[name] = w
 	m.mu.Unlock()
 
-	msgs, err := fetchChannel(m.ctx, name)
+	title, msgs, err := fetchChannel(m.ctx, name)
 	if err != nil {
 		m.mu.Lock()
 		delete(m.wch, name)
 		m.mu.Unlock()
 		return nil, fmt.Errorf("initial fetch: %w", err)
 	}
+	w.setTitle(title)
 	w.store.Add(msgs)
 	go w.loop(m.ctx)
 	log.Printf("watching %s every %s", name, m.interval)
 	return w, nil
+}
+
+func (m *manager) list() []*watcher {
+	m.mu.Lock()
+	out := make([]*watcher, 0, len(m.wch))
+	for _, w := range m.wch {
+		out = append(out, w)
+	}
+	m.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
 }
 
 func main() {
@@ -178,27 +213,15 @@ func main() {
 			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = fmt.Fprintln(w, "telegram-group-rss")
-		_, _ = fmt.Fprintf(w, "GET %s/feed/<channel>\n", cfg.basePath)
-		_, _ = fmt.Fprintf(w, "GET %s/healthz\n", cfg.basePath)
-	})
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/feed/", func(w http.ResponseWriter, r *http.Request) {
-		name := strings.TrimPrefix(r.URL.Path, "/feed/")
-		name = strings.TrimSuffix(name, ".xml")
-		if name == "" || strings.Contains(name, "/") {
-			http.NotFound(w, r)
-			return
+		entries := make([]feedEntry, 0)
+		for _, wc := range mgr.list() {
+			entries = append(entries, feedEntry{
+				Channel: wc.name,
+				Title:   wc.Title(),
+				Msgs:    wc.store.List(),
+			})
 		}
-		watcher, err := mgr.get(name)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		feed := buildFeed(name, watcher.store.List())
+		feed := buildFeed(entries)
 		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
 		if err := feed.WriteRss(w); err != nil {
 			log.Printf("rss write: %v", err)

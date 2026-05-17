@@ -30,28 +30,30 @@ var (
 	bgURLRe    = regexp.MustCompile(`url\(['"]?([^'")]+)['"]?\)`)
 )
 
-func fetchChannel(ctx context.Context, channel string) ([]Message, error) {
+func fetchChannel(ctx context.Context, channel string) (string, []Message, error) {
 	url := fmt.Sprintf("https://t.me/s/%s", channel)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "text/html")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("upstream status %d", resp.StatusCode)
+		return "", nil, fmt.Errorf("upstream status %d", resp.StatusCode)
 	}
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
+
+	title := strings.TrimSpace(doc.Find(".tgme_channel_info_header_title").First().Text())
 
 	var msgs []Message
 	doc.Find(".tgme_widget_message").Each(func(_ int, s *goquery.Selection) {
@@ -100,5 +102,5 @@ func fetchChannel(ctx context.Context, channel string) ([]Message, error) {
 		})
 	})
 
-	return msgs, nil
+	return title, msgs, nil
 }
