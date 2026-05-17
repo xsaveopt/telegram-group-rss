@@ -43,7 +43,7 @@ func fetchChannel(ctx context.Context, channel string) ([]Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("upstream status %d", resp.StatusCode)
 	}

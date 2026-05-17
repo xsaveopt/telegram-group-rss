@@ -179,12 +179,12 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintln(w, "telegram-group-rss")
-		fmt.Fprintf(w, "GET %s/feed/<channel>\n", cfg.basePath)
-		fmt.Fprintf(w, "GET %s/healthz\n", cfg.basePath)
+		_, _ = fmt.Fprintln(w, "telegram-group-rss")
+		_, _ = fmt.Fprintf(w, "GET %s/feed/<channel>\n", cfg.basePath)
+		_, _ = fmt.Fprintf(w, "GET %s/healthz\n", cfg.basePath)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/feed/", func(w http.ResponseWriter, r *http.Request) {
 		name := strings.TrimPrefix(r.URL.Path, "/feed/")
