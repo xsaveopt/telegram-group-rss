@@ -27,7 +27,11 @@ jobs:
     steps:
       # Pinned by commit SHA (not tag) per GitHub's third-party-action hardening
       # guidance. Update the SHA + comment together when bumping.
+      # continue-on-error: the action fails when the package does not exist yet
+      # (newly-created repo, no image pushed). Tolerate that instead of
+      # turning every fresh repo into a daily red-X notification.
       - uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5.0.0
+        continue-on-error: true
         with:
           package-name: ${{ github.event.repository.name }}
           package-type: container
