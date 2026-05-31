@@ -1,17 +1,5 @@
 name: GHCR cleanup
 
-# Retention policy:
-#   - Delete every untagged image version.
-#   - Keep every tagged version (latest, dev, dev-<sha>, semver, etc.).
-#
-# Untagged versions accrue every time a rolling tag (:dev, :latest) moves and
-# orphans the previous digest. Pruning them keeps the package list tidy and
-# reclaims storage without ever touching something you can pull by name.
-#
-# NOTE: this action has no age-based cutoff — untagged versions get removed
-# as soon as this workflow runs. If you want a grace window, run the workflow
-# less often instead of trying to add one (it's not a supported parameter).
-
 on:
   schedule:
     - cron: "0 4 * * *" # daily, 04:00 UTC
@@ -25,12 +13,7 @@ jobs:
   prune-untagged:
     runs-on: ubuntu-latest
     steps:
-      # Pinned by commit SHA (not tag) per GitHub's third-party-action hardening
-      # guidance. Update the SHA + comment together when bumping.
-      # continue-on-error: the action fails when the package does not exist yet
-      # (newly-created repo, no image pushed). Tolerate that instead of
-      # turning every fresh repo into a daily red-X notification.
-      - uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5.0.0
+      - uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55
         continue-on-error: true
         with:
           package-name: ${{ github.event.repository.name }}
