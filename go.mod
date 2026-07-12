@@ -1,4 +1,4 @@
-module github.com/sratabix/telegram-group-rss
+module github.com/xsaveopt/telegram-group-rss
 
 go 1.26.2
 

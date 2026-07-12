@@ -26,7 +26,7 @@ Storage is in-memory only — a restart loses history beyond what the next scrap
 docker run --rm -p 8080:8080 \
   -e CHANNELS="durov,telegram" \
   -e INTERVAL=2m \
-  ghcr.io/sratabix/telegram-group-rss:latest
+  ghcr.io/xsaveopt/telegram-group-rss:latest
 
 curl http://localhost:8080/
 ```
@@ -36,7 +36,7 @@ curl http://localhost:8080/
 ```yaml
 services:
   telegram-group-rss:
-    image: ghcr.io/sratabix/telegram-group-rss:latest
+    image: ghcr.io/xsaveopt/telegram-group-rss:latest
     container_name: telegram-group-rss
     restart: unless-stopped
     ports:
@@ -58,7 +58,7 @@ location /tg/ {
 
 ## Image tags
 
-`latest` for the latest stable release. `1`, `1.2`, `1.2.3` to pin to a major, minor, or patch line. Pre-releases like `1.2.3-rc1` are never tagged `latest`. `dev` tracks the tip of the `main` branch (rebuilt on every commit) and is the easiest tag to use for testing without waiting for a release. Images are published to `ghcr.io/sratabix/telegram-group-rss` and built for `linux/amd64`.
+`latest` for the latest stable release. `1`, `1.2`, `1.2.3` to pin to a major, minor, or patch line. Pre-releases like `1.2.3-rc1` are never tagged `latest`. `dev` tracks the tip of the `main` branch (rebuilt on every commit) and is the easiest tag to use for testing without waiting for a release. Images are published to `ghcr.io/xsaveopt/telegram-group-rss` and built for `linux/amd64`.
 
 ## Environment variables
 

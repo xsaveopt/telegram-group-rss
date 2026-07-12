@@ -23,7 +23,7 @@ type Message struct {
 	Photos    []string
 }
 
-const userAgent = "telegram-group-rss/0.1 (+https://github.com/sratabix/telegram-group-rss)"
+const userAgent = "telegram-group-rss/0.1 (+https://github.com/xsaveopt/telegram-group-rss)"
 
 var (
 	httpClient = &http.Client{Timeout: 30 * time.Second}
