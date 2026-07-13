@@ -189,9 +189,15 @@ func (m *manager) list() []*watcher {
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	cfg, err := loadConfig()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -251,8 +257,9 @@ func main() {
 	log.Printf("listening on %s (base path %q, %d preloaded channels, interval %s)",
 		cfg.addr, cfg.basePath, len(cfg.channels), cfg.interval)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+		return err
 	}
+	return nil
 }
 
 func mountAt(prefix string, h http.Handler) http.Handler {
