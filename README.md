@@ -1,79 +1,59 @@
 # telegram-group-rss
 
-**Scrapes the public web preview of a Telegram channel (`https://t.me/s/<channel>`) and serves each as an RSS feed. No API key, no bot, no auth.**
+A small Go service that turns public Telegram channels into one RSS feed by scraping their web preview at t.me/s/{channel}.
+It works for public channels only, since Telegram groups have no such preview page.
 
-> ⚠️ Only works for **public channels**. Telegram groups don't have a `/s/` preview and would need the Bot API or MTProto instead.
+Each channel listed in CHANNELS is fetched at startup and then polled again every INTERVAL, keeping the newest MAX_MESSAGES posts per channel in memory.
+The feed at / merges every channel's posts newest first, with photos inlined and each item's author set to the channel's display title so you can tell the sources apart.
+History lives in memory, so after a restart the feed holds whatever the preview pages show on the first fetch.
 
-## Contents
+## Running it
 
-- [How it works](#how-it-works)
-- [Quick start](#quick-start)
-- [docker-compose](#docker-compose)
-- [Reverse proxy](#reverse-proxy)
-- [Image tags](#image-tags)
-- [Environment variables](#environment-variables)
-- [Building from source](#building-from-source)
+Images are published to ghcr.io/xsaveopt/telegram-group-rss for linux/amd64.
+The latest tag follows the newest stable release, tags like 1, 1.2 and 1.2.3 pin a major, minor or patch line, and dev is rebuilt from every commit to main.
+Pre-releases such as 1.2.3-rc1 get their version tag and never latest.
 
-## How it works
-
-A small Go service. Channels listed in `CHANNELS` are watched in the background — each one re-polls `https://t.me/s/<channel>` every `INTERVAL`, parses the `.tgme_widget_message` blocks, dedupes by `data-post` id, and keeps the last `MAX_MESSAGES` in memory. `GET /` renders every watched channel's messages as a single merged RSS feed, sorted newest-first, with each item's `<author>` set to the channel's display title so the source stays identifiable when you skim the feed.
-
-Storage is in-memory only — a restart loses history beyond what the next scrape returns (roughly the last 20 messages that `t.me/s/` exposes).
-
-## Quick start
-
-```bash
+```sh
 docker run --rm -p 8080:8080 \
-  -e CHANNELS="durov,telegram" \
-  -e INTERVAL=2m \
+  -e CHANNELS="{channel},{channel}" \
   ghcr.io/xsaveopt/telegram-group-rss:latest
-
-curl http://localhost:8080/
 ```
 
-## docker-compose
+With compose the same thing looks like this:
 
 ```yaml
 services:
   telegram-group-rss:
     image: ghcr.io/xsaveopt/telegram-group-rss:latest
-    container_name: telegram-group-rss
     restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
-      CHANNELS: "durov,telegram"
-      INTERVAL: 5m
+      CHANNELS: "{channel},{channel}"
 ```
 
-## Reverse proxy
-
-`BASE_PATH` makes paths match upstream, so no rewriting is needed:
-
-```nginx
-location /tg/ {
-    proxy_pass http://tgrss:8080;
-}
-```
-
-## Image tags
-
-`latest` for the latest stable release. `1`, `1.2`, `1.2.3` to pin to a major, minor, or patch line. Pre-releases like `1.2.3-rc1` are never tagged `latest`. `dev` tracks the tip of the `main` branch (rebuilt on every commit) and is the easiest tag to use for testing without waiting for a release. Images are published to `ghcr.io/xsaveopt/telegram-group-rss` and built for `linux/amd64`.
+To run it from a checkout, go run . reads the same environment variables, and .env.example lists them with sample values.
 
 ## Environment variables
 
 | Var | Default | Purpose |
 |---|---|---|
+| `CHANNELS` | empty | Channels to watch, separated by commas, spaces or semicolons. Names are 4 to 32 letters, digits or underscores, and an invalid or unreachable one is logged and skipped. |
+| `INTERVAL` | `5m` | How often each channel is polled, as a Go duration like `30s`, `2m` or `1h`. The minimum is `1s`. |
+| `MAX_MESSAGES` | `100` | Posts kept in memory per channel. |
 | `ADDR` | `:8080` | HTTP listen address. |
-| `INTERVAL` | `5m` | Poll interval per channel (Go duration: `30s`, `2m`, `1h`). Anything below ~`1m` risks rate-limiting. |
-| `MAX_MESSAGES` | `100` | Max messages kept in memory per channel. |
-| `CHANNELS` | *(empty)* | Comma / space / semicolon separated list of channels to watch. With nothing here the feed is empty. |
-| `BASE_PATH` | *(empty)* | Mount the app under a subpath (e.g. `/tg`) for reverse-proxying. No trailing slash. |
+| `BASE_PATH` | empty | Subpath the app is served under, like `/tg`. Leading and trailing slashes are normalized. |
 
-## Building from source
+## Reverse proxy
 
-```bash
-go build ./...
-go test ./...
-go run . # respects the same env vars
+With BASE_PATH set to /tg the app answers on /tg/ itself, so the proxy passes the path through unchanged:
+
+```nginx
+location /tg/ {
+    proxy_pass http://{host}:8080;
+}
 ```
+
+## License
+
+GPL-2.0, see LICENSE.
