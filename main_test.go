@@ -481,6 +481,18 @@ func TestRunServesTheFeedAndShutsDown(t *testing.T) {
 		t.Errorf("path outside the base path returned %d, want 404", code)
 	}
 
+	if code, ct, b := get("/tg/health"); code != http.StatusOK || b != "up" {
+		t.Errorf("GET /tg/health = %d %q, want 200 \"up\"", code, b)
+	} else if ct != "text/plain; charset=utf-8" {
+		t.Errorf("GET /tg/health Content-Type = %q", ct)
+	}
+	if code, _, _ := get("/health"); code != http.StatusNotFound {
+		t.Errorf("GET /health outside the base path returned %d, want 404 when BASE_PATH is set", code)
+	}
+	if err := checkHealth(); err != nil {
+		t.Errorf("checkHealth() = %v, want nil while healthy under BASE_PATH", err)
+	}
+
 	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatalf("signal: %v", err)
 	}
@@ -497,5 +509,151 @@ func TestRunServesTheFeedAndShutsDown(t *testing.T) {
 	if resp, err := client.Get("http://" + addr + "/tg/"); err == nil {
 		_ = resp.Body.Close()
 		t.Error("the server is still accepting requests after shutdown")
+	}
+}
+
+func TestRunServesHealthWithoutBasePath(t *testing.T) {
+	startUpstream(t, fixtureHandler(t, "channel.html"))
+	addr := freeAddr(t)
+
+	clearEnv(t)
+	t.Setenv("ADDR", addr)
+	t.Setenv("CHANNELS", "examplechan")
+	t.Setenv("INTERVAL", "1h")
+	t.Setenv("MAX_MESSAGES", "10")
+
+	errc := make(chan error, 1)
+	go func() { errc <- run() }()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	get := func(path string) (int, string, string) {
+		resp, err := client.Get("http://" + addr + path)
+		if err != nil {
+			return 0, "", ""
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return 0, "", ""
+		}
+		return resp.StatusCode, resp.Header.Get("Content-Type"), string(body)
+	}
+
+	waitFor(t, "the server to answer /health", func() bool {
+		code, _, _ := get("/health")
+		return code == http.StatusOK
+	})
+
+	code, ct, body := get("/health")
+	if code != http.StatusOK || body != "up" {
+		t.Errorf("GET /health = %d %q, want 200 \"up\"", code, body)
+	}
+	if ct != "text/plain; charset=utf-8" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	if err := checkHealth(); err != nil {
+		t.Errorf("checkHealth() = %v, want nil while healthy without BASE_PATH", err)
+	}
+
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("run returned %v, want nil after a clean shutdown", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("run did not return after SIGTERM")
+	}
+}
+
+func TestWatcherStale(t *testing.T) {
+	w := &watcher{interval: 10 * time.Millisecond}
+	now := time.Now()
+
+	if !w.stale(now) {
+		t.Error("a watcher with no recorded fetch should be stale")
+	}
+
+	w.recordFetch()
+	if w.stale(time.Now()) {
+		t.Error("a watcher that just fetched should not be stale")
+	}
+
+	w.mu.Lock()
+	w.lastFetch = now.Add(-31 * time.Millisecond)
+	w.mu.Unlock()
+	if !w.stale(now) {
+		t.Error("a fetch older than staleFactor*interval should be stale")
+	}
+
+	w.mu.Lock()
+	w.lastFetch = now.Add(-5 * time.Millisecond)
+	w.mu.Unlock()
+	if w.stale(now) {
+		t.Error("a fetch within staleFactor*interval should not be stale")
+	}
+}
+
+func TestManagerHealthy(t *testing.T) {
+	m := newManager(t.Context(), time.Hour, 10)
+
+	if !m.healthy() {
+		t.Error("a manager with no watchers should be healthy")
+	}
+
+	fresh := &watcher{name: "fresh", interval: time.Hour}
+	fresh.recordFetch()
+	m.wch["fresh"] = fresh
+	if !m.healthy() {
+		t.Error("a manager with one fresh watcher should be healthy")
+	}
+
+	stale := &watcher{name: "stale", interval: time.Millisecond}
+	stale.mu.Lock()
+	stale.lastFetch = time.Now().Add(-time.Hour)
+	stale.mu.Unlock()
+	m.wch["stale"] = stale
+	if !m.healthy() {
+		t.Error("a manager with one fresh and one stale watcher should stay healthy")
+	}
+
+	delete(m.wch, "fresh")
+	if m.healthy() {
+		t.Error("a manager whose only watcher is stale should be degraded")
+	}
+}
+
+func TestHealthHandler(t *testing.T) {
+	m := newManager(t.Context(), time.Hour, 10)
+	h := healthHandler(m)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if rec.Body.String() != "up" {
+		t.Errorf("body = %q, want %q", rec.Body.String(), "up")
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+
+	stale := &watcher{name: "stale", interval: time.Millisecond}
+	stale.mu.Lock()
+	stale.lastFetch = time.Now().Add(-time.Hour)
+	stale.mu.Unlock()
+	m.wch["stale"] = stale
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if rec.Body.String() != "degraded" {
+		t.Errorf("body = %q, want %q", rec.Body.String(), "degraded")
 	}
 }

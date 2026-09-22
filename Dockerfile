@@ -24,4 +24,6 @@ ENV ADDR=:8080 \
 
 EXPOSE 8080
 USER nonroot:nonroot
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/tgrss", "-healthcheck"]
 ENTRYPOINT ["/tgrss"]

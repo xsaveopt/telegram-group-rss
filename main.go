@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -79,13 +81,16 @@ func splitChannels(s string) []string {
 	})
 }
 
+const staleFactor = 3
+
 type watcher struct {
 	name     string
 	store    *Store
 	interval time.Duration
 
-	mu    sync.RWMutex
-	title string
+	mu        sync.RWMutex
+	title     string
+	lastFetch time.Time
 }
 
 func (w *watcher) Title() string {
@@ -106,6 +111,19 @@ func (w *watcher) setTitle(t string) {
 	w.mu.Unlock()
 }
 
+func (w *watcher) recordFetch() {
+	w.mu.Lock()
+	w.lastFetch = time.Now()
+	w.mu.Unlock()
+}
+
+func (w *watcher) stale(now time.Time) bool {
+	w.mu.RLock()
+	last := w.lastFetch
+	w.mu.RUnlock()
+	return now.Sub(last) > staleFactor*w.interval
+}
+
 func (w *watcher) loop(ctx context.Context) {
 	t := time.NewTicker(w.interval)
 	defer t.Stop()
@@ -120,6 +138,7 @@ func (w *watcher) loop(ctx context.Context) {
 				continue
 			}
 			w.setTitle(title)
+			w.recordFetch()
 			if n := w.store.Add(msgs); n > 0 {
 				log.Printf("%s: %d new messages", w.name, n)
 			}
@@ -171,6 +190,7 @@ func (m *manager) get(name string) (*watcher, error) {
 		return nil, fmt.Errorf("initial fetch: %w", err)
 	}
 	w.setTitle(title)
+	w.recordFetch()
 	w.store.Add(msgs)
 	go w.loop(m.ctx)
 	log.Printf("watching %s every %s", name, m.interval)
@@ -188,10 +208,60 @@ func (m *manager) list() []*watcher {
 	return out
 }
 
+func (m *manager) healthy() bool {
+	ws := m.list()
+	if len(ws) == 0 {
+		return true
+	}
+	now := time.Now()
+	for _, w := range ws {
+		if !w.stale(now) {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
+	healthcheck := flag.Bool("healthcheck", false, "GET /health on ADDR's port and exit 0 if healthy, 1 otherwise")
+	flag.Parse()
+
+	if *healthcheck {
+		if err := checkHealth(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func checkHealth() error {
+	_, port, err := net.SplitHostPort(getenv("ADDR", ":8080"))
+	if err != nil {
+		port = "8080"
+	}
+	basePath := normalizeBasePath(os.Getenv("BASE_PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%s%s/health", port, basePath), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func run() error {
@@ -233,6 +303,7 @@ func run() error {
 			log.Printf("rss write: %v", err)
 		}
 	})
+	mux.HandleFunc("/health", healthHandler(mgr))
 
 	var handler http.Handler = mux
 	if cfg.basePath != "" {
@@ -260,6 +331,20 @@ func run() error {
 		return err
 	}
 	return nil
+}
+
+func healthHandler(mgr *manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		status := http.StatusOK
+		body := "up"
+		if !mgr.healthy() {
+			status = http.StatusServiceUnavailable
+			body = "degraded"
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}
 }
 
 func mountAt(prefix string, h http.Handler) http.Handler {
