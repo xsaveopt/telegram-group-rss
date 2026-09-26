@@ -99,8 +99,8 @@ func TestStoreListNewestFirst(t *testing.T) {
 func TestStoreRingCap(t *testing.T) {
 	s := NewStore(3)
 
-	if n := s.Add([]Message{msg("1", 1), msg("2", 2), msg("3", 3), msg("4", 4), msg("5", 5)}); n != 5 {
-		t.Fatalf("Add = %d, want 5", n)
+	if n := s.Add([]Message{msg("1", 1), msg("2", 2), msg("3", 3), msg("4", 4), msg("5", 5)}); n != 3 {
+		t.Errorf("Add = %d, want 3, the number of new messages the store kept", n)
 	}
 
 	got := ids(s.List())
@@ -128,12 +128,14 @@ func TestStoreRingCap(t *testing.T) {
 	}
 }
 
-func TestStoreEvictedIDIsAddedAgain(t *testing.T) {
+func TestStoreEvictedIDIsNotCountedAgain(t *testing.T) {
 	s := NewStore(2)
 	s.Add([]Message{msg("1", 1), msg("2", 2), msg("3", 3)})
 
-	if n := s.Add([]Message{msg("1", 1)}); n != 1 {
-		t.Errorf("re-Add of an evicted id = %d, want 1", n)
+	for round := range 3 {
+		if n := s.Add([]Message{msg("1", 1)}); n != 0 {
+			t.Errorf("round %d: re-Add of an evicted id that is still too old = %d, want 0", round, n)
+		}
 	}
 	got := ids(s.List())
 	want := []string{"3", "2"}
@@ -183,5 +185,101 @@ func TestStoreConcurrentAddAndList(t *testing.T) {
 	}
 	if got := len(s.seen); got != 50 {
 		t.Errorf("seen length = %d, want 50", got)
+	}
+}
+
+func TestStoreZeroDatesSortLast(t *testing.T) {
+	s := NewStore(10)
+	undated := Message{ID: "undated", Channel: "examplechan", PostID: "undated"}
+	if n := s.Add([]Message{undated, msg("1", 1), msg("2", 2)}); n != 3 {
+		t.Fatalf("Add = %d, want 3", n)
+	}
+	got := ids(s.List())
+	want := []string{"2", "1", "undated"}
+	if !equalStrings(got, want) {
+		t.Errorf("List = %v, want %v", got, want)
+	}
+}
+
+func TestStoreFullStoreDoesNotCountOlderMessages(t *testing.T) {
+	s := NewStore(3)
+	s.Add([]Message{msg("1", 1), msg("2", 2), msg("3", 3)})
+
+	undated := Message{ID: "undated", Channel: "examplechan", PostID: "undated"}
+	older := msg("0", 0)
+	for round := range 3 {
+		if n := s.Add([]Message{undated, older}); n != 0 {
+			t.Errorf("round %d: Add of messages older than a full store = %d, want 0", round, n)
+		}
+		got := ids(s.List())
+		want := []string{"3", "2", "1"}
+		if !equalStrings(got, want) {
+			t.Errorf("round %d: List = %v, want %v", round, got, want)
+		}
+		if len(s.seen) != 3 {
+			t.Errorf("round %d: seen holds %d entries, want 3", round, len(s.seen))
+		}
+	}
+
+	if n := s.Add([]Message{older, msg("4", 4)}); n != 1 {
+		t.Errorf("Add with one newer message = %d, want 1", n)
+	}
+	got := ids(s.List())
+	want := []string{"4", "3", "2"}
+	if !equalStrings(got, want) {
+		t.Errorf("List = %v, want %v", got, want)
+	}
+}
+
+func TestStoreEqualDatesOrderIsDeterministic(t *testing.T) {
+	batch := []Message{msg("a", 5), msg("b", 5), msg("c", 5), msg("d", 5), msg("e", 5), msg("f", 5)}
+
+	var first []string
+	for trial := range 50 {
+		s := NewStore(10)
+		s.Add(batch)
+		got := ids(s.List())
+		if trial == 0 {
+			first = got
+			continue
+		}
+		if !equalStrings(got, first) {
+			t.Fatalf("trial %d: List = %v, first trial gave %v", trial, got, first)
+		}
+	}
+}
+
+func TestStoreEqualDatesEvictionIsDeterministic(t *testing.T) {
+	batch := []Message{msg("a", 5), msg("b", 5), msg("c", 5), msg("d", 5), msg("e", 5), msg("f", 5)}
+
+	var first []string
+	for trial := range 50 {
+		s := NewStore(3)
+		s.Add(batch)
+		got := ids(s.List())
+		if len(got) != 3 {
+			t.Fatalf("trial %d: List length = %d, want 3", trial, len(got))
+		}
+		if trial == 0 {
+			first = got
+			continue
+		}
+		if !equalStrings(got, first) {
+			t.Fatalf("trial %d: kept %v, first trial kept %v", trial, got, first)
+		}
+	}
+}
+
+func TestStoreEqualDatesOrderIsStableAcrossAdds(t *testing.T) {
+	s := NewStore(20)
+	s.Add([]Message{msg("a", 5), msg("b", 5), msg("c", 5), msg("d", 5), msg("e", 5)})
+	before := ids(s.List())
+
+	for i := range 10 {
+		s.Add([]Message{msg(fmt.Sprintf("old%d", i), -i-1)})
+		got := ids(s.List())[:5]
+		if !equalStrings(got, before) {
+			t.Fatalf("after Add %d the equal-dated messages reordered to %v, were %v", i, got, before)
+		}
 	}
 }

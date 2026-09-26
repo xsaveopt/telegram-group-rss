@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/xml"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -656,4 +661,447 @@ func TestHealthHandler(t *testing.T) {
 	if rec.Body.String() != "degraded" {
 		t.Errorf("body = %q, want %q", rec.Body.String(), "degraded")
 	}
+}
+
+type getResult struct {
+	w   *watcher
+	n   int
+	err error
+}
+
+func concurrentGets(m *manager, results chan<- getResult) {
+	w, err := m.get("examplechan")
+	n := -1
+	if w != nil {
+		n = len(w.store.List())
+	}
+	results <- getResult{w: w, n: n, err: err}
+}
+
+func blockingUpstream(t *testing.T, next http.Handler) (*atomic.Int64, chan struct{}, chan struct{}) {
+	t.Helper()
+	var calls atomic.Int64
+	entered := make(chan struct{}, 64)
+	release := make(chan struct{})
+	startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		entered <- struct{}{}
+		<-release
+		next.ServeHTTP(w, r)
+	}))
+	return &calls, entered, release
+}
+
+func TestManagerGetConcurrentCallersWaitForTheInitialFetch(t *testing.T) {
+	const callers = 8
+	calls, entered, release := blockingUpstream(t, fixtureHandler(t, "channel.html"))
+	m := newManager(t.Context(), time.Hour, 10)
+
+	results := make(chan getResult, callers)
+	go concurrentGets(m, results)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("the first caller never reached upstream")
+	}
+	for range callers - 1 {
+		go concurrentGets(m, results)
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+
+	var first *watcher
+	for i := range callers {
+		var r getResult
+		select {
+		case r = <-results:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("caller %d never returned", i)
+		}
+		if r.err != nil {
+			t.Errorf("caller %d: get = %v", i, r.err)
+			continue
+		}
+		if r.n != 5 {
+			t.Errorf("caller %d: got a watcher holding %d messages, want 5 once the initial fetch finished", i, r.n)
+		}
+		if first == nil {
+			first = r.w
+		} else if r.w != first {
+			t.Errorf("caller %d: got a different watcher", i)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("upstream calls = %d, want 1", got)
+	}
+	if got := len(m.list()); got != 1 {
+		t.Errorf("manager holds %d watchers, want 1", got)
+	}
+}
+
+func TestManagerGetConcurrentCallersSeeTheInitialFetchFail(t *testing.T) {
+	const callers = 8
+	_, entered, release := blockingUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	m := newManager(t.Context(), time.Hour, 10)
+
+	results := make(chan getResult, callers)
+	go concurrentGets(m, results)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("the first caller never reached upstream")
+	}
+	for range callers - 1 {
+		go concurrentGets(m, results)
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+
+	for i := range callers {
+		var r getResult
+		select {
+		case r = <-results:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("caller %d never returned", i)
+		}
+		if r.err == nil {
+			t.Errorf("caller %d: got watcher %p with %d messages and no error while the initial fetch failed", i, r.w, r.n)
+		}
+		if r.w != nil {
+			t.Errorf("caller %d: got a watcher the manager has already dropped", i)
+		}
+	}
+	if got := len(m.list()); got != 0 {
+		t.Errorf("manager holds %d watchers, want 0", got)
+	}
+}
+
+type healthProbe struct {
+	port string
+	mu   sync.Mutex
+	path string
+}
+
+func (p *healthProbe) seen() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.path
+}
+
+func startHealthServer(t *testing.T, l net.Listener, code int) *healthProbe {
+	t.Helper()
+	p := &healthProbe{}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p.mu.Lock()
+		p.path = r.URL.Path
+		p.mu.Unlock()
+		w.WriteHeader(code)
+	}))
+	if l != nil {
+		_ = srv.Listener.Close()
+		srv.Listener = l
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	_, port, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split listener address: %v", err)
+	}
+	p.port = port
+	return p
+}
+
+func TestCheckHealthStatus(t *testing.T) {
+	cases := []struct {
+		name    string
+		code    int
+		wantErr string
+	}{
+		{"ok", http.StatusOK, ""},
+		{"degraded", http.StatusServiceUnavailable, "503"},
+		{"server error", http.StatusInternalServerError, "500"},
+		{"no content is not healthy", http.StatusNoContent, "204"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			clearEnv(t)
+			p := startHealthServer(t, nil, c.code)
+			t.Setenv("ADDR", ":"+p.port)
+
+			err := checkHealth()
+			if c.wantErr == "" {
+				if err != nil {
+					t.Errorf("checkHealth() = %v, want nil", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("checkHealth() = %v, want an error mentioning %s", err, c.wantErr)
+			}
+			if got := p.seen(); got != "/health" {
+				t.Errorf("probed path = %q, want /health", got)
+			}
+		})
+	}
+}
+
+func TestCheckHealthUsesOnlyThePortAndTheBasePath(t *testing.T) {
+	clearEnv(t)
+	p := startHealthServer(t, nil, http.StatusOK)
+	t.Setenv("ADDR", "0.0.0.0:"+p.port)
+	t.Setenv("BASE_PATH", "tg/rss/")
+
+	if err := checkHealth(); err != nil {
+		t.Errorf("checkHealth() = %v, want nil", err)
+	}
+	if got := p.seen(); got != "/tg/rss/health" {
+		t.Errorf("probed path = %q, want /tg/rss/health", got)
+	}
+}
+
+func TestCheckHealthUnreachable(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("ADDR", freeAddr(t))
+
+	if err := checkHealth(); err == nil {
+		t.Error("checkHealth() = nil with nothing listening, want an error")
+	}
+}
+
+func TestCheckHealthFallsBackToTheDefaultPort(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:8080")
+	if err != nil {
+		t.Skipf("port 8080 is busy: %v", err)
+	}
+	p := startHealthServer(t, l, http.StatusOK)
+
+	for _, addr := range []string{"not-an-address", "8080"} {
+		clearEnv(t)
+		t.Setenv("ADDR", addr)
+		if err := checkHealth(); err != nil {
+			t.Errorf("ADDR=%q: checkHealth() = %v, want nil via the default port", addr, err)
+		}
+	}
+	if got := p.seen(); got != "/health" {
+		t.Errorf("probed path = %q, want /health", got)
+	}
+}
+
+func TestHealthcheckProcess(t *testing.T) {
+	if os.Getenv("TGRSS_HEALTHCHECK_PROCESS") != "1" {
+		t.Skip("runs only as the healthcheck subprocess")
+	}
+	os.Args = []string{os.Args[0], "-healthcheck"}
+	main()
+}
+
+func TestHealthcheckFlagExitCode(t *testing.T) {
+	healthy := startHealthServer(t, nil, http.StatusOK)
+	degraded := startHealthServer(t, nil, http.StatusServiceUnavailable)
+	_, deadPort, err := net.SplitHostPort(freeAddr(t))
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		port string
+		want int
+	}{
+		{"healthy", healthy.port, 0},
+		{"degraded", degraded.port, 1},
+		{"unreachable", deadPort, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestHealthcheckProcess$")
+			cmd.Env = append(os.Environ(), "TGRSS_HEALTHCHECK_PROCESS=1", "ADDR=:"+c.port, "BASE_PATH=")
+			err := cmd.Run()
+			got := 0
+			if err != nil {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) {
+					t.Fatalf("run: %v", err)
+				}
+				got = exitErr.ExitCode()
+			}
+			if got != c.want {
+				t.Errorf("exit code = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func startRun(t *testing.T, addr string) func(string) (int, string, string) {
+	t.Helper()
+	errc := make(chan error, 1)
+	go func() { errc <- run() }()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	get := func(path string) (int, string, string) {
+		resp, err := client.Get("http://" + addr + path)
+		if err != nil {
+			return 0, "", ""
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return 0, "", ""
+		}
+		return resp.StatusCode, resp.Header.Get("Content-Type"), string(body)
+	}
+
+	t.Cleanup(func() {
+		select {
+		case err := <-errc:
+			t.Errorf("run returned early: %v", err)
+			return
+		default:
+		}
+		if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+			t.Errorf("signal: %v", err)
+			return
+		}
+		select {
+		case err := <-errc:
+			if err != nil {
+				t.Errorf("run returned %v, want nil after a clean shutdown", err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Error("run did not return after SIGTERM")
+		}
+	})
+
+	waitFor(t, "the server to answer", func() bool {
+		code, _, _ := get("/health")
+		return code != 0
+	})
+	return get
+}
+
+func parseFeed(t *testing.T, body string) rssDoc {
+	t.Helper()
+	assertWellFormed(t, body)
+	var doc rssDoc
+	if err := xml.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("unmarshal rss: %v", err)
+	}
+	return doc
+}
+
+func TestRunRootServesAnEmptyFeedWithoutChannels(t *testing.T) {
+	startUpstream(t, fixtureHandler(t, "channel.html"))
+	addr := freeAddr(t)
+	clearEnv(t)
+	t.Setenv("ADDR", addr)
+
+	get := startRun(t, addr)
+
+	code, ct, body := get("/")
+	if code != http.StatusOK {
+		t.Fatalf("GET / = %d, want 200", code)
+	}
+	if ct != "application/rss+xml; charset=utf-8" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	doc := parseFeed(t, body)
+	if doc.Channel.Title != "Telegram" {
+		t.Errorf("channel title = %q, want Telegram", doc.Channel.Title)
+	}
+	if len(doc.Channel.Items) != 0 {
+		t.Errorf("got %d items, want 0", len(doc.Channel.Items))
+	}
+	if code, _, b := get("/health"); code != http.StatusOK || b != "up" {
+		t.Errorf("GET /health = %d %q, want 200 \"up\"", code, b)
+	}
+}
+
+func TestRunRootServesAnEmptyFeedForAQuietChannel(t *testing.T) {
+	var calls atomic.Int64
+	quiet := fixtureHandler(t, "empty.html")
+	startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		quiet.ServeHTTP(w, r)
+	}))
+	addr := freeAddr(t)
+	clearEnv(t)
+	t.Setenv("ADDR", addr)
+	t.Setenv("CHANNELS", "quietchan")
+	t.Setenv("INTERVAL", "1h")
+
+	get := startRun(t, addr)
+	waitFor(t, "the preload fetch", func() bool { return calls.Load() >= 1 })
+
+	var body string
+	waitFor(t, "the feed to answer", func() bool {
+		code, _, b := get("/")
+		body = b
+		return code == http.StatusOK
+	})
+	doc := parseFeed(t, body)
+	if len(doc.Channel.Items) != 0 {
+		t.Errorf("got %d items, want 0", len(doc.Channel.Items))
+	}
+}
+
+func TestRunKeepsServingWhenAPreloadFails(t *testing.T) {
+	good := fixtureHandler(t, "channel.html")
+	startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/s/brokenchan" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		good.ServeHTTP(w, r)
+	}))
+	addr := freeAddr(t)
+	clearEnv(t)
+	t.Setenv("ADDR", addr)
+	t.Setenv("CHANNELS", "brokenchan, examplechan, bad-name")
+	t.Setenv("INTERVAL", "1h")
+
+	get := startRun(t, addr)
+
+	var body string
+	waitFor(t, "the working channel to appear in the feed", func() bool {
+		code, _, b := get("/")
+		body = b
+		return code == http.StatusOK && strings.Contains(b, "examplechan/101")
+	})
+	doc := parseFeed(t, body)
+	if len(doc.Channel.Items) != 5 {
+		t.Errorf("got %d items, want the 5 from the working channel", len(doc.Channel.Items))
+	}
+	if code, _, b := get("/health"); code != http.StatusOK || b != "up" {
+		t.Errorf("GET /health = %d %q, want 200 \"up\"", code, b)
+	}
+}
+
+func TestRunRetriesAFailedPreload(t *testing.T) {
+	var calls atomic.Int64
+	good := fixtureHandler(t, "channel.html")
+	startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		good.ServeHTTP(w, r)
+	}))
+	addr := freeAddr(t)
+	clearEnv(t)
+	t.Setenv("ADDR", addr)
+	t.Setenv("CHANNELS", "flakychan")
+	t.Setenv("INTERVAL", "1s")
+
+	get := startRun(t, addr)
+
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if code, _, b := get("/"); code == http.StatusOK && strings.Contains(b, "examplechan/101") {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("a configured channel whose first fetch failed never reached the feed, upstream saw %d calls", calls.Load())
 }

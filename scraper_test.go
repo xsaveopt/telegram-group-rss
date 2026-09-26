@@ -258,3 +258,95 @@ func TestFetchChannelCanceledContext(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 }
+
+func TestFetchChannelParsesMediaFixture(t *testing.T) {
+	startUpstream(t, fixtureHandler(t, "media.html"))
+
+	_, msgs, err := fetchChannel(t.Context(), "examplechan")
+	if err != nil {
+		t.Fatalf("fetchChannel: %v", err)
+	}
+	byID := make(map[string]Message, len(msgs))
+	for _, m := range msgs {
+		byID[m.ID] = m
+	}
+	if len(msgs) != 5 || len(byID) != 5 {
+		t.Fatalf("got %d messages, want 5: %+v", len(msgs), msgs)
+	}
+
+	t.Run("reply", func(t *testing.T) {
+		m := byID["examplechan/201"]
+		if m.PlainText != "Reply body" {
+			t.Errorf("PlainText = %q, want the reply's own text", m.PlainText)
+		}
+		if m.HTML != "Reply body" {
+			t.Errorf("HTML = %q, want the reply's own text", m.HTML)
+		}
+		if m.Author != "" {
+			t.Errorf("Author = %q, want empty for an unsigned post, not the quoted message's author", m.Author)
+		}
+		if want := mustTime(t, "2024-06-01T08:00:00+00:00"); !m.Date.Equal(want) {
+			t.Errorf("Date = %v, want %v", m.Date, want)
+		}
+	})
+
+	t.Run("signed reply with a quoted photo", func(t *testing.T) {
+		m := byID["examplechan/202"]
+		if m.Author != "Sample Poster" {
+			t.Errorf("Author = %q, want %q", m.Author, "Sample Poster")
+		}
+		if m.PlainText != "Signed reply" {
+			t.Errorf("PlainText = %q, want %q", m.PlainText, "Signed reply")
+		}
+		if len(m.Photos) != 0 {
+			t.Errorf("Photos = %v, want none from the quoted message's thumbnail", m.Photos)
+		}
+	})
+
+	t.Run("forward", func(t *testing.T) {
+		m := byID["examplechan/203"]
+		if m.HTML != "Forwarded <b>body</b>" {
+			t.Errorf("HTML = %q, want %q", m.HTML, "Forwarded <b>body</b>")
+		}
+		if m.PlainText != "Forwarded body" {
+			t.Errorf("PlainText = %q, want %q", m.PlainText, "Forwarded body")
+		}
+		if m.Author != "" {
+			t.Errorf("Author = %q, want empty, the forward source is not the post author", m.Author)
+		}
+		if m.Channel != "examplechan" || m.PostID != "203" {
+			t.Errorf("Channel/PostID = %q/%q, want examplechan/203", m.Channel, m.PostID)
+		}
+	})
+
+	t.Run("video", func(t *testing.T) {
+		m := byID["examplechan/204"]
+		if m.PlainText != "Video caption" {
+			t.Errorf("PlainText = %q, want %q", m.PlainText, "Video caption")
+		}
+		if want := mustTime(t, "2024-06-01T11:00:00+00:00"); !m.Date.Equal(want) {
+			t.Errorf("Date = %v, want %v from the message footer, not the video duration", m.Date, want)
+		}
+		if len(m.Photos) != 0 {
+			t.Errorf("Photos = %v, want none for a video", m.Photos)
+		}
+	})
+
+	t.Run("album", func(t *testing.T) {
+		m := byID["examplechan/207"]
+		want := []string{
+			"https://cdn.example.test/album-1.jpg",
+			"https://cdn.example.test/album-2.jpg",
+			"https://cdn.example.test/album-3.jpg",
+		}
+		if !equalStrings(m.Photos, want) {
+			t.Errorf("Photos = %v, want %v", m.Photos, want)
+		}
+		if m.PlainText != "Album caption" {
+			t.Errorf("PlainText = %q, want %q", m.PlainText, "Album caption")
+		}
+		if m.Link != "https://t.me/examplechan/207" {
+			t.Errorf("Link = %q", m.Link)
+		}
+	})
+}
