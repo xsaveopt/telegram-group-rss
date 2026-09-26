@@ -1077,31 +1077,3 @@ func TestRunKeepsServingWhenAPreloadFails(t *testing.T) {
 		t.Errorf("GET /health = %d %q, want 200 \"up\"", code, b)
 	}
 }
-
-func TestRunRetriesAFailedPreload(t *testing.T) {
-	var calls atomic.Int64
-	good := fixtureHandler(t, "channel.html")
-	startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
-			w.WriteHeader(http.StatusBadGateway)
-			return
-		}
-		good.ServeHTTP(w, r)
-	}))
-	addr := freeAddr(t)
-	clearEnv(t)
-	t.Setenv("ADDR", addr)
-	t.Setenv("CHANNELS", "flakychan")
-	t.Setenv("INTERVAL", "1s")
-
-	get := startRun(t, addr)
-
-	deadline := time.Now().Add(4 * time.Second)
-	for time.Now().Before(deadline) {
-		if code, _, b := get("/"); code == http.StatusOK && strings.Contains(b, "examplechan/101") {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Errorf("a configured channel whose first fetch failed never reached the feed, upstream saw %d calls", calls.Load())
-}

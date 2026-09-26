@@ -88,6 +88,9 @@ type watcher struct {
 	store    *Store
 	interval time.Duration
 
+	ready   chan struct{}
+	initErr error
+
 	mu        sync.RWMutex
 	title     string
 	lastFetch time.Time
@@ -172,26 +175,36 @@ func (m *manager) get(name string) (*watcher, error) {
 	m.mu.Lock()
 	if w, ok := m.wch[name]; ok {
 		m.mu.Unlock()
+		if w.ready != nil {
+			<-w.ready
+			if w.initErr != nil {
+				return nil, w.initErr
+			}
+		}
 		return w, nil
 	}
 	w := &watcher{
 		name:     name,
 		store:    NewStore(m.max),
 		interval: m.interval,
+		ready:    make(chan struct{}),
 	}
 	m.wch[name] = w
 	m.mu.Unlock()
 
 	title, msgs, err := fetchChannel(m.ctx, name)
 	if err != nil {
+		w.initErr = fmt.Errorf("initial fetch: %w", err)
 		m.mu.Lock()
 		delete(m.wch, name)
 		m.mu.Unlock()
-		return nil, fmt.Errorf("initial fetch: %w", err)
+		close(w.ready)
+		return nil, w.initErr
 	}
 	w.setTitle(title)
 	w.recordFetch()
 	w.store.Add(msgs)
+	close(w.ready)
 	go w.loop(m.ctx)
 	log.Printf("watching %s every %s", name, m.interval)
 	return w, nil
