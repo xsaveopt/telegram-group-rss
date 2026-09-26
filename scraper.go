@@ -78,7 +78,9 @@ func fetchChannel(ctx context.Context, channel string) (string, []Message, error
 			date, _ = time.Parse(time.RFC3339, t)
 		}
 
-		author := strings.TrimSpace(s.Find(".tgme_widget_message_author_name").First().Text())
+		author := strings.TrimSpace(s.Find(".tgme_widget_message_author_name").FilterFunction(func(_ int, a *goquery.Selection) bool {
+			return a.Closest(".tgme_widget_message_reply").Length() == 0
+		}).First().Text())
 
 		var photos []string
 		s.Find(".tgme_widget_message_photo_wrap").Each(func(_ int, p *goquery.Selection) {
