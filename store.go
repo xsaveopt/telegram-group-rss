@@ -20,23 +20,22 @@ func (s *Store) Add(msgs []Message) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	added := 0
+	var added []string
 	for _, m := range msgs {
 		if _, ok := s.seen[m.ID]; ok {
 			continue
 		}
 		s.seen[m.ID] = m
-		added++
+		added = append(added, m.ID)
 	}
-	if added == 0 {
+	if len(added) == 0 {
 		return 0
 	}
 
 	ids := make([]string, 0, len(s.seen))
-	for id := range s.seen {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool {
+	ids = append(ids, s.order...)
+	ids = append(ids, added...)
+	sort.SliceStable(ids, func(i, j int) bool {
 		return s.seen[ids[i]].Date.After(s.seen[ids[j]].Date)
 	})
 	if len(ids) > s.max {
@@ -46,7 +45,13 @@ func (s *Store) Add(msgs []Message) int {
 		ids = ids[:s.max]
 	}
 	s.order = ids
-	return added
+	kept := 0
+	for _, id := range added {
+		if _, ok := s.seen[id]; ok {
+			kept++
+		}
+	}
+	return kept
 }
 
 func (s *Store) List() []Message {
